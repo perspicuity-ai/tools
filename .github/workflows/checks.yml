@@ -1,0 +1,36 @@
+name: checks
+
+# Static checks only. The suite in tools/dictate/tests/ needs an API key, a
+# microphone-free but real display, and a network; run it locally.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: |
+          status=0
+          while IFS= read -r file; do
+            printf '%s: ' "$file"
+            if bash -n "$file"; then echo ok; else echo FAILED; status=1; fi
+          done < <(git ls-files '*.sh' 'tools/*/dictate' 'tools/*/*.sh')
+          exit $status
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          # Only fail on errors. The scripts are deliberately written for bash
+          # and use some idioms shellcheck warns about at lower severities.
+          shellcheck --severity=error \
+            $(git ls-files '*.sh' 'tools/*/dictate' 'tools/*/*.sh')
+
+      - name: Python syntax
+        run: |
+          python3 -m compileall -q tools/ && echo "python ok"

@@ -1,0 +1,19 @@
+# Never commit credentials or machine-local state.
+.env
+*.key
+*.pem
+*credentials*
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Python bytecode from the test harness
+__pycache__/
+*.pyc
+
+# Test scratch output
+*.log

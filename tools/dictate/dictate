@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+# dictate — toggle-style voice dictation via the OpenAI transcription API
+#
+#   First press  → starts recording
+#   Second press → stops, transcribes in the background, inserts the text
+#
+# Requires: sox, curl, jq, xdotool, xclip, notify-send
+# Set OPENAI_API_KEY in ~/.config/dictate/env
+#
+# ---------------------------------------------------------------------------
+# What changed vs. the previous version, and why (measured on this machine,
+# 26s of 16 kHz audio, i9-13900H, ~40 ms RTT to api.openai.com):
+#
+#   * Insertion was the dominant cost. `xdotool type --delay 12` sleeps 12 ms
+#     per character: a 170-character transcript burned ~2.0 s, a 400-character
+#     one over 4.5 s, and it still raced when you switched windows. Now the
+#     text goes to the clipboard and is pasted with ctrl+v (~65 ms, constant).
+#   * Model: gpt-transcribe (current recommended) instead of gpt-4o-transcribe.
+#     Measured cost is the same (1.2-1.4 s), word error rate is lower, and it
+#     supports `keywords` for domain vocabulary.
+#   * `prompt` no longer carries an instruction. Whisper-style instruction
+#     prompts add hallucination risk; the prompt is now context plus a
+#     configurable keyword list.
+#   * Upload is FLAC, not WAV (53% smaller measured) and the 0.5 s trailing
+#     silence pad is gone by default (it bought no accuracy, only bytes).
+#   * The "still transcribing, please wait" busy guard is gone. Transcription
+#     and insertion now run in a detached worker, so you can start the next
+#     recording immediately. A sequence counter plus a paste lock keeps
+#     insertion ordered and prevents two transcripts interleaving.
+#   * Requests have a timeout and one retry instead of hanging forever.
+#
+# If a new model misbehaves, pin the old path with:
+#     DICTATE_MODEL=gpt-4o-transcribe
+#     DICTATE_LANGUAGES=          # then DICTATE_LANGUAGE=en is sent instead
+# ---------------------------------------------------------------------------
+
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dictate"
+ENV_FILE="$CONFIG_DIR/env"                  # API key + settings; authoritative
+KEYWORDS_FILE="$CONFIG_DIR/keywords.txt"
+CONTEXT_FILE="$CONFIG_DIR/context.txt"
+# Optional lower-precedence defaults, so the API-key file can stay minimal.
+OPTIONS_FILE="$CONFIG_DIR/options.conf"
+
+# options.conf is read first, then env — anything set in env wins. The real
+# process environment is read last of all, so a one-off invocation can always
+# override both, e.g.  DICTATE_MODEL=gpt-4o-transcribe dictate
+for _f in "$OPTIONS_FILE" "$ENV_FILE"; do
+    if [[ -f "$_f" ]]; then
+        # shellcheck disable=SC1090
+        source "$_f"
+    fi
+done
+unset _f
+
+STATE_DIR="${DICTATE_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/dictate}"
+LOCKFILE="$STATE_DIR/rec.lock"          # written on start, removed on stop
+PASTE_LOCK="$STATE_DIR/paste.lock"      # serialises insertion across workers
+SEQFILE="$STATE_DIR/seq"                # monotonic counter for ordering
+CLIP_SAVE="$STATE_DIR/clipboard.saved"  # pre-dictation clipboard contents
+TIMELOG="${DICTATE_TIMING_LOG:-$STATE_DIR/timing.log}"
+
+# --- tuned defaults ---------------------------------------------------------
+# Each setting is a plain shell variable, so a later assignment in options.conf
+# or env simply replaces the value here. (Nothing is marked readonly.)
+MODEL="${DICTATE_MODEL:-gpt-transcribe}"
+LANGUAGE="${DICTATE_LANGUAGE:-en}"
+LANGUAGES="${DICTATE_LANGUAGES:-en}"
+INSERT_MODE="${DICTATE_INSERT:-paste}"   # paste | type | clipboard
+USE_PAD="${DICTATE_PAD:-0}"              # 1 = keep the old 0.5 s trailing pad
+MIN_DURATION="${DICTATE_MIN_DURATION:-0.5}"
+KEEP_CLIPBOARD="${DICTATE_KEEP_CLIPBOARD:-0}"  # 1 = leave text on the clipboard
+NOTIFY="${DICTATE_NOTIFY:-1}"
+API_TIMEOUT="${DICTATE_API_TIMEOUT:-60}"
+API_RETRIES="${DICTATE_API_RETRIES:-1}"
+PASTE_KEY="${DICTATE_PASTE_KEY:-ctrl+v}"  # terminals need ctrl+shift+v
+TYPE_DELAY="${DICTATE_TYPE_DELAY:-2}"    # only used by INSERT_MODE=type
+DEBUG_AUDIO="${DICTATE_DEBUG_AUDIO:-/tmp/dictate-last}"
+
+ENCODER="${DICTATE_ENCODER:-flac}"       # flac | wav | mp3
+case "$ENCODER" in
+    flac) EXT=flac ;;
+    mp3)  EXT=mp3 ;;
+    *)    EXT=wav ;;
+esac
+
+if ! mkdir -p "$STATE_DIR" 2>/dev/null || [[ ! -w "$STATE_DIR" ]]; then
+    # XDG_RUNTIME_DIR is the right home for this, but it is not always writable
+    # (odd session setups, restricted sandboxes). Losing the lock file there
+    # would silently break recording, so fall back to a private temp dir.
+    STATE_DIR="${TMPDIR:-/tmp}/dictate-$(id -u)"
+    LOCKFILE="$STATE_DIR/rec.lock"
+    PASTE_LOCK="$STATE_DIR/paste.lock"
+    SEQFILE="$STATE_DIR/seq"
+    CLIP_SAVE="$STATE_DIR/clipboard.saved"
+    TIMELOG="${DICTATE_TIMING_LOG:-$STATE_DIR/timing.log}"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+fi
+
+notify() { # notify <message> [urgency]
+    [[ "$NOTIFY" == "1" ]] || return 0
+    command -v notify-send >/dev/null || return 0
+    notify-send "Dictate" "$1" --urgency="${2:-normal}" 2>/dev/null || true
+}
+
+_t_start=$(date +%s%N); _t_last=$_t_start
+t() {
+    local now phase_ms total_ms
+    now=$(date +%s%N)
+    phase_ms=$(( (now - _t_last) / 1000000 ))
+    total_ms=$(( (now - _t_start) / 1000000 ))
+    echo "$(date +%H:%M:%S) ${phase_ms}ms (total ${total_ms}ms) $1" >> "$TIMELOG" 2>/dev/null || true
+    _t_last=$now
+}
+
+next_seq() { # monotonically increasing, survives concurrent invocations
+    local n
+    n=$(flock "$SEQFILE.lock" bash -c '
+        n=$(cat "$1" 2>/dev/null || echo 0)
+        n=$(( n + 1 ))
+        printf "%s" "$n" > "$1"
+        printf "%s" "$n"' _ "$SEQFILE" 2>/dev/null) || n=0
+    printf '%s' "${n:-0}"
+}
+
+# Wave N+1 must not paste before wave N, or the second worker's clipboard write
+# (which happens before its own ctrl+v) would overwrite the first worker's text
+# before the application had read it — silently dropping a transcript.
+# Insertion order and the clipboard
+# ---------------------------------
+# There is no safe way to make an *earlier* utterance wait for a *later* one:
+# if worker 2 reaches insertion first, blocking it does not make worker 1 any
+# readier, it just loses worker 2's text. So insertion happens in completion
+# order, which for normal use (utterances seconds apart, transcription faster
+# than it takes to speak the next one) is also recording order.
+#
+# What must be atomic is "write clipboard, then send ctrl+v". If two workers
+# interleaved those steps, worker 2's clipboard write would land between worker
+# 1's write and worker 1's keystroke, and worker 1 would paste worker 2's text.
+# Both steps therefore happen while holding the paste lock.
+
+cleanup_worker() {
+    restore_clipboard
+}
+
+# --- clipboard preservation -------------------------------------------------
+save_clipboard() {
+    [[ "$INSERT_MODE" == "clipboard" ]] && return 0
+    [[ "$KEEP_CLIPBOARD" == "1" ]] && return 0
+    command -v xclip >/dev/null || return 0
+    rm -f "$STATE_DIR/clipboard.claimed"   # fresh dictation: restore is owed again
+    xclip -selection clipboard -o >"$CLIP_SAVE" 2>/dev/null || rm -f "$CLIP_SAVE"
+}
+
+restore_clipboard() {
+    local payload=""
+    if [[ -s "$CLIP_SAVE" ]]; then
+        payload="$CLIP_SAVE"
+    elif [[ "$KEEP_CLIPBOARD" != "1" ]]; then
+        printf '' > "$STATE_DIR/empty.clip"
+        payload="$STATE_DIR/empty.clip"
+    fi
+    [[ -n "$payload" ]] || return 0
+    # Idempotent: the success path restores under the paste lock, and the exit
+    # trap calls this again. Without the marker the trap's second restore would
+    # clobber whatever the user copied while the transcription ran.
+    [[ -f "$STATE_DIR/clipboard.claimed" ]] && return 0
+    : > "$STATE_DIR/clipboard.claimed"
+    # Outlive this process long enough to hand the old contents back.
+    #
+    # `_close_lockfds`: this is called while the caller holds the paste lock on
+    # fd 9. Without closing it here, this short-lived child inherits the
+    # descriptor and keeps the lock held for the whole sleep, stalling the next
+    # dictation's paste for seconds.
+    { _close_lockfds; nohup bash -c 'sleep 4; exec xclip -selection clipboard -i "$1"' \
+        _ "$payload" >/dev/null 2>&1 & }
+    disown 2>/dev/null || true
+}
+
+# --- insertion --------------------------------------------------------------
+# xclip forks a daemon to own the clipboard selection and can live for as long
+# as the text is on the clipboard. Callers hold the paste lock on fd 9, so every
+# xclip spawn must close fds 3-9 first: an inherited fd 9 would keep the lock
+# held long after the insertion finished, stalling the next dictation.
+_close_lockfds() {
+    local fd
+    for fd in 3 4 5 6 7 8 9; do
+        eval "exec $fd>&-" 2>/dev/null || true
+    done
+}
+
+insert_text() { # insert_text <text> <target-window>
+    local text="$1" target="${2:-}" ok=0
+    [[ -n "$text" ]] || return 1
+
+    if [[ "$INSERT_MODE" == "clipboard" ]]; then
+        printf '%s' "$text" | { _close_lockfds; xclip -selection clipboard -i; }
+        notify "Copied ${#text} chars — press ctrl+v" low
+        return 0
+    fi
+
+    if [[ "$INSERT_MODE" == "paste" ]] && command -v xclip >/dev/null; then
+        # Plain `xclip -i`: it forks and holds the selection, so the write is
+        # non-blocking. Do NOT add `-loops 1` — that makes xclip stay in the
+        # foreground waiting to serve a paste, which deadlocks when the
+        # keystroke below never lands (e.g. no focused window).
+        if printf '%s' "$text" | { _close_lockfds; xclip -selection clipboard -i; } 2>/dev/null; then
+            sleep 0.06   # let the selection owner settle
+            if [[ -n "$target" ]]; then
+                xdotool windowactivate --sync "$target" 2>/dev/null || true
+            fi
+            xdotool key --clearmodifiers "$PASTE_KEY" 2>/dev/null
+            # Verify rather than assume: if nothing owns the selection by now,
+            # the keystroke pasted nothing, so fall through to typing.
+            if [[ "$(_close_lockfds; xclip -selection clipboard -o 2>/dev/null)" == "$text" ]]; then
+                ok=1
+            else
+                t "insert: paste verification failed, falling back to typing"
+            fi
+        fi
+    fi
+
+    if (( ok == 0 )); then
+        # Fallback: type it, but fast. The old delay of 12 ms was the single
+        # largest source of perceived lag.
+        if [[ -n "$target" ]]; then
+            xdotool windowactivate --sync "$target" 2>/dev/null || true
+        fi
+        xdotool type --clearmodifiers --delay "$TYPE_DELAY" -- "$text" 2>/dev/null && ok=1
+    fi
+    return $(( 1 - ok ))
+}
+
+# --- transcription worker (runs detached) -----------------------------------
+transcribe_and_insert() { # <src> <seq> <target> <duration>
+    local src="$1" seq="$2" target="$3" duration="$4"
+    local enc="${src%.*}"
+    local send="$src" payload="$src" response http body text attempt
+
+    # Regardless of how this worker ends, the insertion queue must be released.
+    trap 'cleanup_worker' EXIT INT TERM
+
+    # Optional trailing silence, if anyone wants the old behaviour back.
+    if [[ "$USE_PAD" == "1" ]]; then
+        sox "$src" "$enc.padded.$EXT" pad 0 0.5 2>/dev/null && send="$enc.padded.$EXT"
+    fi
+
+    # Build the request.
+    local -a args=(
+        -sS --max-time "$API_TIMEOUT"
+        https://api.openai.com/v1/audio/transcriptions
+        -H "Authorization: Bearer $OPENAI_API_KEY"
+    )
+    args+=( -F "model=$MODEL" -F "file=@$send" )
+
+    if [[ "$MODEL" == whisper-1 || "$MODEL" == *"gpt-4o"* ]]; then
+        args+=( -F "language=$LANGUAGE" )
+        [[ "$MODEL" != *diarize* ]] && args+=( -F "prompt=$(_build_prompt)" )
+    else
+        # gpt-transcribe: `language` was replaced by `languages`, and keywords
+        # are hints for literal terms. Never send both `language` and `languages`.
+        [[ -n "$LANGUAGES" ]] && args+=( -F "languages[]=$LANGUAGES" )
+        local kw
+        while IFS= read -r kw; do
+            [[ -n "$kw" ]] && args+=( -F "keywords[]=$kw" )
+        done < <(_keywords)
+        local ctx; ctx=$(_build_prompt)
+        [[ -n "$ctx" ]] && args+=( -F "prompt=$ctx" )
+    fi
+
+    for (( attempt = 0; attempt <= API_RETRIES; attempt++ )); do
+        t "api: attempt $((attempt + 1)) model=$MODEL file=$send ($(stat -c%s "$send" 2>/dev/null || echo 0) B)"
+        response=$(curl "${args[@]}" -w $'\n%{http_code}' 2>/dev/null) || response=""
+        http=$(printf '%s' "$response" | tail -1)
+        body=$(printf '%s' "$response" | sed '$d')
+        t "api: http=$http"
+        [[ "$http" == "200" ]] && break
+        (( attempt < API_RETRIES )) && sleep 0.4
+    done
+
+    cp "$send" "$DEBUG_AUDIO.$EXT" 2>/dev/null || true
+    rm -f "$src" "$enc.padded.$EXT"
+
+    if [[ "$http" != "200" ]]; then
+        local msg
+        msg=$(printf '%s' "$body" | jq -r '.error.message // .error // "unknown"' 2>/dev/null)
+        t "api: FAILED $http $msg"
+        notify "API error ($http): $msg" critical
+        cleanup_worker; exit 1
+    fi
+
+    text=$(printf '%s' "$body" | jq -r '.text // empty' 2>/dev/null)
+    t "api: transcript ${#text} chars"
+
+    if [[ -z "$text" ]]; then
+        notify "No speech detected" normal
+        cleanup_worker; exit 0
+    fi
+
+    # One worker inserts at a time. The clipboard write, the ctrl+v keystroke,
+    # and scheduling the clipboard restore all happen under the lock, so a
+    # concurrent worker can never swap the clipboard out between them (which
+    # would paste the wrong text, or clobber a later paste mid-flight).
+    # The timeout means a wedged insert delays the next one rather than
+    # deadlocking it; pasting late beats not pasting at all.
+    (
+        if ! flock -w 30 9; then
+            t "insert: paste lock busy >30s, inserting anyway"
+        fi
+        t "insert: seq=$seq mode=$INSERT_MODE (${#text} chars)"
+        if [[ -n "$target" ]] && ! xdotool getwindowname "$target" >/dev/null 2>&1; then
+            t "insert: target window gone, using current focus"
+            target=""
+        fi
+        insert_text "$text" "$target"
+        t "insert: done rc=$?"
+        restore_clipboard
+        sleep 0.15
+    ) 9>"$PASTE_LOCK"
+
+    if [[ "$INSERT_MODE" == "clipboard" ]]; then
+        : # already notified
+    elif [[ "$KEEP_CLIPBOARD" == "1" ]]; then
+        notify "Pasted ${#text} chars (kept on clipboard)" low
+    else
+        notify "Pasted ${#text} chars" low
+    fi
+    t "worker: finished seq=$seq (audio was ${duration}s)"
+}
+
+_keywords() {
+    [[ -f "$KEYWORDS_FILE" ]] || return 0
+    grep -v '^\s*#' "$KEYWORDS_FILE" 2>/dev/null | sed '/^\s*$/d'
+}
+
+_build_prompt() {
+    local ctx=""
+    [[ -f "$CONTEXT_FILE" ]] && ctx=$(head -c 600 "$CONTEXT_FILE" 2>/dev/null | tr '\n' ' ')
+    printf '%s' "${ctx:-Dictation of ordinary prose.}"
+}
+
+# --- residual recording processes -------------------------------------------
+cleanup_orphans() {
+    local orphans
+    orphans=$(pgrep -f "rec -q -r 16000 -c 1 --buffer 1024" 2>/dev/null || true)
+    if [[ -n "$orphans" ]]; then
+        t "cleanup: killing orphan rec PIDs: $orphans"
+        echo "$orphans" | xargs kill -INT 2>/dev/null || true
+        sleep 0.1
+        echo "$orphans" | xargs kill -9 2>/dev/null || true
+    fi
+}
+
+# The detached worker re-sources this file purely to get the functions above.
+# Stop here so it never falls through into the toggle logic below.
+if [[ "${DICTATE_SOURCED:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+# ===========================================================================
+# TOGGLE OFF — stop recording, hand off to a background worker
+# ===========================================================================
+if [[ -f "$LOCKFILE" ]]; then
+    read -r REC_PID AUDIO TARGET < "$LOCKFILE" || true
+    rm -f "$LOCKFILE"
+
+    if [[ -z "${REC_PID:-}" ]]; then
+        notify "No recording in progress" normal
+        exit 0
+    fi
+
+    t "stop: SIGINT to rec PID=$REC_PID"
+    kill -INT "$REC_PID" 2>/dev/null || true
+    for _ in $(seq 1 60); do
+        kill -0 "$REC_PID" 2>/dev/null || break
+        sleep 0.05
+    done
+    if kill -0 "$REC_PID" 2>/dev/null; then
+        t "stop: rec ignored SIGINT, SIGKILL"
+        kill -9 "$REC_PID" 2>/dev/null || true
+    fi
+    t "stop: rec gone"
+
+    if [[ ! -s "$AUDIO" ]]; then
+        notify "No audio captured" normal
+        exit 0
+    fi
+
+    DURATION=$(soxi -D "$AUDIO" 2>/dev/null || echo 0)
+    t "stop: soxi duration=${DURATION}s"
+    if awk -v d="$DURATION" -v m="$MIN_DURATION" 'BEGIN { exit !(d < m) }'; then
+        notify "Recording too short (${DURATION}s)" normal
+        rm -f "$AUDIO"
+        exit 0
+    fi
+
+    SEQ=$(next_seq)
+    save_clipboard
+    notify "Transcribing ${DURATION}s…" low
+
+    # Detach: this invocation exits now, so the next hotkey press can record
+    # immediately instead of waiting for the network round trip.
+    DICTATE_STATE_DIR="$STATE_DIR" DICTATE_SOURCED=1 \
+    nohup bash -c '
+        source "$1"
+        transcribe_and_insert "$2" "$3" "$4" "$5"
+    ' _ "$0" "$AUDIO" "$SEQ" "${TARGET:-}" "$DURATION" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+
+    t "handoff: worker started for seq=$SEQ, hotkey free"
+    exit 0
+fi
+
+# ===========================================================================
+# TOGGLE ON — begin recording
+# ===========================================================================
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+    notify "No OPENAI_API_KEY set. Add it to $ENV_FILE" critical
+    exit 1
+fi
+
+cleanup_orphans
+
+AUDIO="$STATE_DIR/rec-$(date +%s%N).$EXT"
+TARGET=$(xdotool getactivewindow 2>/dev/null || echo "")
+
+notify "Recording… press hotkey again to stop" low
+t "rec: start encoder=$ENCODER target=${TARGET:-none}"
+
+# `setsid` + redirected stdio: the recorder must not keep the caller's pipe
+# open, or the script would appear to hang when run as `dictate | ...`,
+# and it must survive this invocation exiting.
+PULSE_LATENCY_MSEC=30 setsid rec -q -r 16000 -c 1 --buffer 1024 "$AUDIO" \
+    </dev/null >/dev/null 2>&1 &
+REC_PID=$!
+printf '%s %s %s\n' "$REC_PID" "$AUDIO" "$TARGET" > "$LOCKFILE"
+t "rec: pid=$REC_PID file=$AUDIO"
+exit 0
