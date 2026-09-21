@@ -167,6 +167,15 @@ class TestDeadLinks(Fixture):
         self.assertEqual(len(plan["dead"]), 1)
         self.assertEqual(plan["dead"][0]["target"], "zzz-missing.md")
 
+    def test_scheme_shaped_target_is_not_a_dead_link(self):
+        # urn:li:organization:ID is an identifier, not a missing file. Resolving it against
+        # the filesystem produced a false dead link in a real migration report.
+        (self.repo / "docs/SCHEME.md").write_text(
+            "# S\n\nSee [organisation](urn:li:organization:101) and [x](mailto:a@b.c).\n",
+            encoding="utf-8")
+        plan = json.loads(self.run_tool().stdout)
+        self.assertEqual(plan["dead"], [])
+
     def test_fenced_example_is_not_counted_as_a_dead_link(self):
         (self.repo / "docs/FENCED.md").write_text(
             "# F\n\n```\n[a](also-missing.md)\n```\n", encoding="utf-8")

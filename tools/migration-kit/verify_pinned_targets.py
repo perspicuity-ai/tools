@@ -20,7 +20,7 @@ import re
 import subprocess
 import sys
 
-URL_RE = re.compile(r"https://github\.com/([^/]+/[^/]+)/blob/([0-9a-f]{7,40})/(.+?)(?:[#?].*)?$")
+URL_RE = re.compile(r"https://github\.com/([^/]+/[^/]+)/blob/([0-9a-f]{7,40}|main|master|HEAD)/(.+?)(?:[#?].*)?$")
 
 
 def gh_file_exists(slug, sha, path):

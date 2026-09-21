@@ -20,6 +20,9 @@ from pathlib import Path
 
 TEXT_SUFFIXES = {".md", ".txt"}
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)\s#?]+)(?:[#?][^)\s]*)?\)")
+# Any scheme-shaped target is not a file path: urn:li:organization:ID is an identifier,
+# not a missing document. Resolving these against the filesystem produces false dead links.
+SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 
@@ -52,7 +55,7 @@ def find_dead(repo_root, paths):
                 continue
             for match in LINK_RE.finditer(text):
                 target = match.group(1)
-                if target.startswith(("http://", "https://", "mailto:", "tel:", "data:", "#")):
+                if target.startswith("#") or SCHEME_RE.match(target):
                     continue
                 checked += 1
                 resolved = (f.parent / target).resolve()
