@@ -141,6 +141,37 @@ Fenced code blocks are copied through byte-identical, because a link-shaped stri
 example is not a link. Without this tool the only way to size the job is a text pattern match,
 which counts those examples and overstates the work — in one real case, 42 against a true 15.
 
+### `split_corpus.py`
+
+Moves domain-scoped decision records into their unit repositories, and splits a chained corpus
+with them.
+
+```sh
+split_corpus.py --corpus <Decisions dir> --routing routing.json \
+    --chain-tool <path to chain.py> --target content=/path --target company=/path --apply
+```
+
+**Each chain is rebuilt by calling `chain.py append`, never by hashing entries here.** The live
+chain hashes an entry *including its own `sha256` field*, so a second implementation produces
+links that do not verify — three attempts to reimplement it disagreed with the tool before this
+was settled by direct computation. There is no reason to hold a second copy of that logic.
+
+Two consequences it states rather than hides: new entries get new timestamps and sequence
+numbers, and **signatures do not carry over**, because a signature covered a predecessor link
+that no longer exists.
+
+### `repoint_records.py`
+
+Rewrites references to records that moved. Two forms exist and only one is a link:
+
+```sh
+repoint_records.py --root <repo> --moved moved.json --sha main [--apply]
+```
+
+A markdown link is the obvious form. A **bare identifier** in front matter — `parent:`,
+`depends_on:`, `id:` — is the one that fails silently, because the record still reads as if it
+resolves locally and nothing errors. Both are reported.
+
 ## Order of work
 
 1. `dead_links.py` on the move scope, for a baseline.
