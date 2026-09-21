@@ -11,6 +11,7 @@ directory are the ones that actually run against the installed tool.
 | Tool | What it does | Needs |
 |---|---|---|
 | [`dictate`](tools/dictate/) | Toggle voice dictation. Press a hotkey, speak, press it again: the words are transcribed and inserted into the focused window. | Linux/X11, an OpenAI API key |
+| [`migration-kit`](tools/migration-kit/) | Move a directory between repositories without breaking the links that cross the boundary. Verifies mirror integrity, pins cross-repo links, and reads open work across several roots. | Python 3.10+, `gh` for the remote checks |
 
 ## Shape of a tool
 
